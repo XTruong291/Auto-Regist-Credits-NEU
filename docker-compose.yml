@@ -1,0 +1,18 @@
+services:
+  bot:
+    build: .
+    container_name: course-registration-bot
+    ports:
+      - "8000:8000"
+    environment:
+      - LOG_LEVEL=INFO
+      - NUM_WORKERS=4
+      - MAX_CONNECTIONS=200
+      - MAX_KEEPALIVE_CONNECTIONS=100
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
