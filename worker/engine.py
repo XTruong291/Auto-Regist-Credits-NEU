@@ -89,19 +89,29 @@ class RequestEngine:
             logger.error("Lỗi lấy StudyProgramID: %s", e)
             raise Exception(f"Lấy StudyProgramID thất bại: {e}")
 
+    def _find_course_metadata_safe(self, data: list, raw_course_id: str) -> Optional[dict]:
+        clean_id = str(raw_course_id).strip().upper()
+        for item in data:
+            if isinstance(item, dict):
+                curr_id = str(item.get("CurriculumID", "")).strip().upper()
+                alias_id = str(item.get("ScheduleStudyUnitAlias", "")).strip().upper()
+                if clean_id == curr_id or clean_id == alias_id:
+                    return item
+        return None
+
     async def fetch_course_metadata(self, jwt_token: str, course_ids: List[str], study_program_id: str, regist_type: str) -> None:
         """Fetch and cache course metadata by CurriculumID for requested courses."""
+        import json
         headers = self._build_shared_headers(jwt_token)
         for course_id in course_ids:
-            print(f"👉 Đang xử lý ID gốc truyền vào: '{course_id}'")
-            base_id = course_id.split("_", 1)[0]
-            print(f"✂️ Kết quả sau khi cắt (sẽ dùng làm ReqParam3): '{base_id}'")
+            clean_id = str(course_id).strip().upper()
+            base_id = clean_id.split("_", 1)[0]
             payload = {
                 "ReqParam1": study_program_id,
                 "ReqParam2": regist_type,
                 "ReqParam3": base_id,
             }
-            print(f"📦 Payload chuẩn bị bắn: { {'ReqParam1': study_program_id, 'ReqParam2': regist_type, 'ReqParam3': base_id} }")
+            logger.info("🔍 [DEBUG] Sending payload: ReqParam3='%s' (Original: '%s')", base_id, course_id)
             try:
                 response = await self.client.post(
                     self.ALL_COURSES_URL,
@@ -115,16 +125,19 @@ class RequestEngine:
                     logger.error("Lỗi: Metadata trả về không hợp lệ cho môn %s", course_id)
                     continue
 
-                match = next(
-                    (
-                        item
-                        for item in data
-                        if isinstance(item, dict) and item.get("CurriculumID") == course_id
-                    ),
-                    None,
-                )
+                match = self._find_course_metadata_safe(data, course_id)
                 if match is None:
-                    logger.error("Lỗi: Không tìm thấy lớp %s", course_id)
+                    logger.error("🚨 FAILED TO MATCH COURSE: '%s' (Length: %d)", course_id, len(course_id))
+                    logger.error("📦 Số lượng lớp học server nhả về: %d", len(data))
+                    if data:
+                        logger.error("X-QUANG PHẦN TỬ ĐẦU TIÊN:\n%s", json.dumps(data[0], indent=2, ensure_ascii=False))
+                        
+                        logger.error("--- DANH SÁCH CÁC MÔN SERVER TRẢ VỀ ---")
+                        for idx, item in enumerate(data):
+                            if isinstance(item, dict):
+                                curr_id = item.get("CurriculumID", "None")
+                                alias_id = item.get("ScheduleStudyUnitAlias", "None")
+                                logger.error(" [%d] CurriculumID: '%s' | Alias: '%s'", idx, curr_id, alias_id)
                     continue
 
                 async with self.cache_lock:
@@ -135,7 +148,8 @@ class RequestEngine:
 
     async def is_slot_available(self, jwt_token: str, course_id: str, study_program_id: str, regist_type: str) -> bool:
         headers = self._build_shared_headers(jwt_token)
-        base_id = course_id.split("_", 1)[0]
+        clean_id = str(course_id).strip().upper()
+        base_id = clean_id.split("_", 1)[0]
         payload = {
             "ReqParam1": study_program_id,
             "ReqParam2": regist_type,
@@ -152,7 +166,10 @@ class RequestEngine:
             data = response.json()
             if not isinstance(data, list):
                 return False
-            match = next((item for item in data if isinstance(item, dict) and item.get("CurriculumID") == course_id), None)
+            match = self._find_course_metadata_safe(data, course_id)
+            if match is not None:
+                async with self.cache_lock:
+                    self.course_cache[course_id] = match
             if match is None:
                 return False
             return int(match.get("NumberOfStudents", 0)) < int(match.get("MaxStudentNumber", 1))
@@ -195,13 +212,23 @@ class RequestEngine:
                 break
             cached_obj = cache_snapshot.get(course_id)
             if not isinstance(cached_obj, dict):
-                logger.error("Lỗi: Không tìm thấy lớp %s trong course_cache", course_id)
-                last_detail = {
-                    "success": False,
-                    "status_code": None,
-                    "message": f"Không tìm thấy metadata cho {course_id}",
-                }
-                continue
+                logger.warning("Cache rỗng cho môn %s. Bot đang tự động đi lấy metadata...", course_id)
+                await self.fetch_course_metadata(jwt_token, [course_id], study_program_id, regist_type)
+                
+                # Đọc lại cache snapshot sau khi lấy xong
+                async with self.cache_lock:
+                    cache_snapshot = self.course_cache.copy()
+                cached_obj = cache_snapshot.get(course_id)
+                
+                # Nếu vẫn không có, lúc này mới thực sự bỏ cuộc
+                if not isinstance(cached_obj, dict):
+                    logger.error("Lỗi: Không tìm thấy lớp %s dù đã cố fetch lại", course_id)
+                    last_detail = {
+                        "success": False,
+                        "status_code": None,
+                        "message": f"Không tìm thấy metadata cho {course_id}",
+                    }
+                    continue
 
             payload_obj = copy.deepcopy(cached_obj)
             payload_obj["IsRegisted"] = False
@@ -219,7 +246,7 @@ class RequestEngine:
                     headers=headers,
                     timeout=3.0,
                 )
-                print(f"🚀 Bắn đạn thành công tới URL: {response.request.url}")
+                print(f"🚀 Request thành công tới URL: {response.request.url}")
 
                 response_text = response.text
                 logger.info("NEU response status=%s body=%s", response.status_code, response_text)

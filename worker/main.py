@@ -70,10 +70,12 @@ class CourseRegistrationWorker:
         return [
             {
                 "job_id": job.job_id,
+                "course_id": job.course_ids,
                 "username": job.username,
                 "regist_type": job.regist_type,
                 "status": job.status,
-                "target_timestamp": job.target_timestamp
+                "target_timestamp": job.target_timestamp,
+                "created_at": job.created_at.isoformat()
             }
             for job in self.jobs.values()
         ]
@@ -120,7 +122,9 @@ class CourseRegistrationWorker:
     async def _execute_job(self, job: RegistrationJob) -> None:
         """Execute registration job in Camping Mode."""
         try:
-            logger.info("--- Bắt đầu chế độ Mai phục (CAMPING) cho Job %s ---", job.job_id)
+            msg_start = f"--- Bắt đầu chế độ Mai phục (CAMPING) cho Job {job.job_id} ---"
+            print(msg_start)
+            logger.info(msg_start)
             job.status = "CAMPING"
             start_time = time.time()
             timeout = 7 * 24 * 3600
@@ -128,15 +132,31 @@ class CourseRegistrationWorker:
             token = None
             study_program_id = None
             
+            attempt_count = 0
+            last_check_time = time.time()
+            
             while time.time() - start_time < timeout:
                 if job.cancel_event.is_set():
-                    logger.info("Job %s đã bị hủy.", job.job_id)
+                    msg_cancel = f"Job {job.job_id} đã bị hủy."
+                    print(msg_cancel)
+                    logger.info(msg_cancel)
                     job.status = "CANCELLED"
                     break
                     
+                attempt_count += 1
+                current_time = time.time()
+                elapsed = current_time - last_check_time
+                last_check_time = current_time
+                
+                msg_scan = f"🔄[Lần {attempt_count}] Quét slot môn {job.course_ids} (Khoảng cách: {elapsed:.2f}s)"
+                print(msg_scan)
+                logger.info(msg_scan)
+                
                 try:
                     if token is None or study_program_id is None:
-                        logger.info("Đang xác thực tài khoản cho %s...", job.username)
+                        msg_auth = f"Đang xác thực tài khoản cho {job.username}..."
+                        print(msg_auth)
+                        logger.info(msg_auth)
                         token = await self.request_engine.authenticate(job.username, job.password)
                         study_program_id = await self.request_engine.fetch_study_program_id(token)
                     
@@ -147,7 +167,9 @@ class CourseRegistrationWorker:
                         is_available = await self.request_engine.is_slot_available(token, course_id, study_program_id, job.regist_type)
                         if is_available:
                             any_available = True
-                            logger.info("Phát hiện slot trống cho môn %s!", course_id)
+                            msg_found = f"PHÁT HIỆN SLOT TRỐNG MÔN {course_id}! GỌI API ĐĂNG KÝ..."
+                            print(msg_found)
+                            logger.info(msg_found)
                             break
                     
                     if job.cancel_event.is_set():
@@ -157,7 +179,9 @@ class CourseRegistrationWorker:
                         await asyncio.sleep(random.uniform(2.5, 4.5))
                         continue
                     
-                    logger.info("Có slot trống, bắt đầu bắn request đăng ký...")
+                    msg_fire = "Bắn request đăng ký..."
+                    print(msg_fire)
+                    logger.info(msg_fire)
                     attempt_results = await self.request_engine.multi_course_register(
                         course_ids=job.course_ids,
                         study_program_id=study_program_id,
@@ -176,36 +200,52 @@ class CourseRegistrationWorker:
                             job.result[course_id] = f"Lỗi/SK {status_code} - {message}"
                     
                     if success_count > 0:
-                        logger.info("Job %s: Đăng ký thành công %s môn học", job.job_id, success_count)
+                        msg_success = f"✅ Job {job.job_id}: Đăng ký thành công {success_count} môn học"
+                        print(msg_success)
+                        logger.info(msg_success)
                         job.status = "SUCCESS"
                         break
                     else:
-                        logger.info("Đăng ký thất bại (chậm chân). Tiếp tục mai phục...")
+                        msg_fail = "❌ Đăng ký thất bại (chậm chân). Tiếp tục mai phục..."
+                        print(msg_fail)
+                        logger.info(msg_fail)
                         await asyncio.sleep(random.uniform(2.5, 4.5))
 
                 except httpx.HTTPStatusError as e:
                     status_code = e.response.status_code
                     if status_code == 401:
-                        logger.warning("Token hết hạn (401), đang tự động lấy token mới...")
+                        msg_401 = "⚠️ Token hết hạn (401), đang tự động lấy token mới..."
+                        print(msg_401)
+                        logger.warning(msg_401)
                         token = None
                     elif status_code == 429:
-                        logger.warning("Bị Rate Limit (429), ngủ 60s...")
+                        msg_429 = "🛑 Bị Rate Limit (429), ngủ 60s..."
+                        print(msg_429)
+                        logger.warning(msg_429)
                         await asyncio.sleep(60)
                     else:
-                        logger.warning("Lỗi HTTP %s, thử lại sau 10s...", status_code)
+                        msg_http = f"⚠️ Lỗi HTTP {status_code}, thử lại sau 10s..."
+                        print(msg_http)
+                        logger.warning(msg_http)
                         await asyncio.sleep(10)
                 except Exception as e:
-                    logger.warning("Lỗi hệ thống/Network: %s, thử lại sau 10s...", e)
+                    msg_sys = f"⚠️ Lỗi hệ thống/Network: {e}, thử lại sau 10s..."
+                    print(msg_sys)
+                    logger.warning(msg_sys)
                     await asyncio.sleep(10)
             else:
                 if not job.cancel_event.is_set():
-                    logger.info("Job %s đã Timeout sau 7 ngày mai phục.", job.job_id)
+                    msg_to = f"⏰ Job {job.job_id} đã Timeout sau 7 ngày mai phục."
+                    print(msg_to)
+                    logger.info(msg_to)
                     job.status = "TIMEOUT"
 
         except Exception as e:
             job.status = "FAILED"
             job.error = str(e)
-            logger.exception(f"Job {job.job_id} execution error: {e}")
+            msg_err = f"🔥 Job {job.job_id} execution error: {e}"
+            print(msg_err)
+            logger.exception(msg_err)
 
     async def _warmup_connection(self, target_timestamp: float) -> None:
         warmup_at = target_timestamp - 3.0
