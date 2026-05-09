@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Query
 from fastapi.responses import JSONResponse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import asyncio
 from contextlib import asynccontextmanager
@@ -47,18 +47,33 @@ async def health_check():
     }
 
 
-@app.get("/utils/time")
-async def get_time_utils():
-    """Helper endpoint for quickly obtaining useful Unix timestamps."""
-    now = datetime.utcnow()
-    plus_1_min = now + timedelta(minutes=1)
-    plus_5_min = now + timedelta(minutes=5)
-    return {
-        "now_iso_utc": now.isoformat(),
-        "now_timestamp": now.timestamp(),
-        "plus_1_min_timestamp": plus_1_min.timestamp(),
-        "plus_5_min_timestamp": plus_5_min.timestamp(),
-    }
+@app.get("/utils/generate-timestamp")
+async def generate_timestamp(
+    target_str: str = Query(..., description='Thời gian mở cổng theo giờ VN (Ví dụ: "2026-05-10 08:00:00")'),
+    drift_seconds: float = Query(-30.361, description='Độ lệch đồng hồ Server NEU')
+):
+    """Sniper Calculator - Công cụ tính toán thời gian nổ súng chuyên dụng cho server NEU."""
+    logger.info(f"Sniper Calculator: Tính timestamp cho mục tiêu '{target_str}' với độ lệch {drift_seconds}s")
+    try:
+        dt_vnt = datetime.strptime(target_str, "%Y-%m-%d %H:%M:%S")
+        dt_utc = dt_vnt - timedelta(hours=7)
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        base_timestamp = dt_utc.timestamp()
+        final_timestamp = base_timestamp - drift_seconds
+
+        return {
+            "1_target_vnt": dt_vnt.isoformat(),
+            "2_target_utc": dt_utc.isoformat(),
+            "3_drift_applied": drift_seconds,
+            "4_FINAL_TIMESTAMP": final_timestamp,
+            "instruction": "Copy dãy số 4_FINAL_TIMESTAMP và dán vào tham số target_timestamp của API tạo Job."
+        }
+    except ValueError:
+        logger.error(f"Sniper Calculator: Đầu vào sai định dạng '{target_str}'")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Sai định dạng thời gian. Vui lòng nhập chuẩn theo mẫu: YYYY-MM-DD HH:MM:SS"
+        )
 
 
 @app.post("/jobs", response_model=JobSubmitResponse, status_code=status.HTTP_201_CREATED)
@@ -66,7 +81,9 @@ async def submit_job(request: JobSubmitRequest):
     """
     Submit course registration job.
     
-    - **jwt_token**: JWT token copied from browser
+    - **username**: Tài khoản sinh viên
+    - **password**: Mật khẩu sinh viên
+    - **regist_type**: Loại đăng ký (NKH,...)
     - **course_ids**: List of course IDs to register
     - **target_timestamp**: Unix timestamp for registration attempt
     """
@@ -78,7 +95,9 @@ async def submit_job(request: JobSubmitRequest):
             )
 
         job_id = await worker_pool.submit_job(
-            jwt_token=request.jwt_token,
+            username=request.username,
+            password=request.password,
+            regist_type=request.regist_type,
             course_ids=request.course_ids,
             target_timestamp=request.target_timestamp,
         )
@@ -95,6 +114,38 @@ async def submit_job(request: JobSubmitRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to submit job"
         )
+
+
+@app.get("/jobs", response_model=list[dict])
+async def get_all_jobs():
+    """
+    Giám sát trạng thái toàn bộ Jobs.
+    """
+    if worker_pool is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Worker pool not initialized"
+        )
+    return worker_pool.get_all_jobs_status()
+
+
+@app.delete("/jobs/{job_id}")
+async def cancel_job(job_id: str):
+    """
+    Hủy Job đang chạy.
+    """
+    if worker_pool is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Worker pool not initialized"
+        )
+    success = worker_pool.cancel_job(job_id)
+    if success:
+        return {"message": "Hủy thành công"}
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Không tìm thấy job"
+    )
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)

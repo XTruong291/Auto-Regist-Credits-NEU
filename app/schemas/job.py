@@ -4,7 +4,9 @@ from datetime import datetime
 
 
 class JobSubmitRequest(BaseModel):
-    jwt_token: str = Field(..., min_length=1)
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+    regist_type: str = Field(default="NKH")
     course_ids: List[str] = Field(..., min_items=1, max_items=50)
     target_timestamp: float = Field(..., gt=0)
 

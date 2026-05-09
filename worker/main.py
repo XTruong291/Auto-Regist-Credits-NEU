@@ -1,4 +1,5 @@
 import asyncio
+# pyrefly: ignore [missing-import]
 import httpx
 import logging
 from typing import Optional, Dict, Any
@@ -6,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import time
 import uuid
+import random
 from worker.retry import RetryManager, ErrorClassifier, RetryConfig
 from worker.engine import RequestEngine, FastScheduler
 from worker.scheduler import PrecisionScheduler, JobScheduler
@@ -16,13 +18,16 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RegistrationJob:
     job_id: str
-    jwt_token: str
+    username: str
+    password: str
+    regist_type: str
     course_ids: list[str]
     target_timestamp: float
-    status: str = "pending"
+    status: str = "PENDING"
     result: Dict[str, str] = field(default_factory=dict)
     error: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class CourseRegistrationWorker:
@@ -61,30 +66,41 @@ class CourseRegistrationWorker:
         self.current_proxy_idx = 0
         self.metadata_ready = False
 
-    async def initialize(self, jwt_token: str, course_ids: list[str]) -> None:
-        """Load metadata cache for requested courses."""
-        async with self.request_engine.cache_lock:
-            missing_ids = [cid for cid in course_ids if cid not in self.request_engine.course_cache]
-        if not missing_ids:
-            self.metadata_ready = True
-            return
-        await self.request_engine.fetch_course_metadata(jwt_token, missing_ids)
-        self.metadata_ready = True
+    def get_all_jobs_status(self) -> list[dict]:
+        return [
+            {
+                "job_id": job.job_id,
+                "username": job.username,
+                "regist_type": job.regist_type,
+                "status": job.status,
+                "target_timestamp": job.target_timestamp
+            }
+            for job in self.jobs.values()
+        ]
+
+    def cancel_job(self, job_id: str) -> bool:
+        job = self.jobs.get(job_id)
+        if job:
+            job.cancel_event.set()
+            job.status = "CANCELLED"
+            return True
+        return False
 
     async def submit_job(
         self,
-        jwt_token: str,
+        username: str,
+        password: str,
+        regist_type: str,
         course_ids: list[str],
         target_timestamp: float,
     ) -> str:
         """Submit registration job."""
-        logger.info("Worker startup metadata pre-fetch in progress...")
-        await self.initialize(jwt_token, course_ids)
-
         job_id = str(uuid.uuid4())
         job = RegistrationJob(
             job_id=job_id,
-            jwt_token=jwt_token,
+            username=username,
+            password=password,
+            regist_type=regist_type,
             course_ids=course_ids,
             target_timestamp=target_timestamp,
         )
@@ -102,45 +118,92 @@ class CourseRegistrationWorker:
         return job_id
 
     async def _execute_job(self, job: RegistrationJob) -> None:
-        """Execute registration job."""
+        """Execute registration job in Camping Mode."""
         try:
-            logger.info("--- Đã lấy được Job %s từ Queue ---", job.job_id)
-            job.status = "running"
-            logger.info("Metadata pre-fetch check before wait_until...")
-            await self.initialize(job.jwt_token, job.course_ids)
+            logger.info("--- Bắt đầu chế độ Mai phục (CAMPING) cho Job %s ---", job.job_id)
+            job.status = "CAMPING"
+            start_time = time.time()
+            timeout = 7 * 24 * 3600
+            
+            token = None
+            study_program_id = None
+            
+            while time.time() - start_time < timeout:
+                if job.cancel_event.is_set():
+                    logger.info("Job %s đã bị hủy.", job.job_id)
+                    job.status = "CANCELLED"
+                    break
+                    
+                try:
+                    if token is None or study_program_id is None:
+                        logger.info("Đang xác thực tài khoản cho %s...", job.username)
+                        token = await self.request_engine.authenticate(job.username, job.password)
+                        study_program_id = await self.request_engine.fetch_study_program_id(token)
+                    
+                    any_available = False
+                    for course_id in job.course_ids:
+                        if job.cancel_event.is_set():
+                            break
+                        is_available = await self.request_engine.is_slot_available(token, course_id, study_program_id, job.regist_type)
+                        if is_available:
+                            any_available = True
+                            logger.info("Phát hiện slot trống cho môn %s!", course_id)
+                            break
+                    
+                    if job.cancel_event.is_set():
+                        continue
 
-            warmup_task = asyncio.create_task(self._warmup_connection(job.target_timestamp))
-
-            await PrecisionScheduler.wait_until(job.target_timestamp)
-            await warmup_task
-
-            # In manual-token mode, StudyProgramID should be provided by integration config.
-            study_program_id = "MANUAL"
-
-            logger.info("--- BẮT ĐẦU BẮN REQUEST LÊN NEU ---")
-            attempt_result = await self.request_engine.register_course(
-                curriculum_ids=job.course_ids,
-                study_program_id=study_program_id,
-                jwt_token=job.jwt_token,
-            )
-            status_code = attempt_result.get("status_code")
-            message = attempt_result.get("message", "Unknown response")
-            for course_id in job.course_ids:
-                if status_code is None:
-                    job.result[course_id] = message
-                else:
-                    job.result[course_id] = (
-                        f"Lỗi/SK {status_code} - {message}"
-                        if not attempt_result.get("success")
-                        else f"OK {status_code} - {message}"
+                    if not any_available:
+                        await asyncio.sleep(random.uniform(2.5, 4.5))
+                        continue
+                    
+                    logger.info("Có slot trống, bắt đầu bắn request đăng ký...")
+                    attempt_results = await self.request_engine.multi_course_register(
+                        course_ids=job.course_ids,
+                        study_program_id=study_program_id,
+                        regist_type=job.regist_type,
+                        jwt_token=token,
                     )
+                    
+                    success_count = 0
+                    for course_id, result in attempt_results.items():
+                        status_code = result.get("status_code")
+                        message = result.get("message", "Unknown response")
+                        if result.get("success"):
+                            success_count += 1
+                            job.result[course_id] = f"OK {status_code} - {message}"
+                        else:
+                            job.result[course_id] = f"Lỗi/SK {status_code} - {message}"
+                    
+                    if success_count > 0:
+                        logger.info("Job %s: Đăng ký thành công %s môn học", job.job_id, success_count)
+                        job.status = "SUCCESS"
+                        break
+                    else:
+                        logger.info("Đăng ký thất bại (chậm chân). Tiếp tục mai phục...")
+                        await asyncio.sleep(random.uniform(2.5, 4.5))
 
-            if attempt_result.get("success"):
-                logger.info("Job %s: Registered %s courses", job.job_id, len(job.course_ids))
+                except httpx.HTTPStatusError as e:
+                    status_code = e.response.status_code
+                    if status_code == 401:
+                        logger.warning("Token hết hạn (401), đang tự động lấy token mới...")
+                        token = None
+                    elif status_code == 429:
+                        logger.warning("Bị Rate Limit (429), ngủ 60s...")
+                        await asyncio.sleep(60)
+                    else:
+                        logger.warning("Lỗi HTTP %s, thử lại sau 10s...", status_code)
+                        await asyncio.sleep(10)
+                except Exception as e:
+                    logger.warning("Lỗi hệ thống/Network: %s, thử lại sau 10s...", e)
+                    await asyncio.sleep(10)
+            else:
+                if not job.cancel_event.is_set():
+                    logger.info("Job %s đã Timeout sau 7 ngày mai phục.", job.job_id)
+                    job.status = "TIMEOUT"
 
-            job.status = "completed"
         except Exception as e:
-            job.status = "failed"
+            job.status = "FAILED"
             job.error = str(e)
             logger.exception(f"Job {job.job_id} execution error: {e}")
 
@@ -200,7 +263,9 @@ class WorkerPool:
 
     async def submit_job(
         self,
-        jwt_token: str,
+        username: str,
+        password: str,
+        regist_type: str,
         course_ids: list[str],
         target_timestamp: float,
     ) -> str:
@@ -209,7 +274,7 @@ class WorkerPool:
             worker = self.workers[self.current_worker_idx]
             self.current_worker_idx = (self.current_worker_idx + 1) % len(self.workers)
 
-        return await worker.submit_job(jwt_token, course_ids, target_timestamp)
+        return await worker.submit_job(username, password, regist_type, course_ids, target_timestamp)
 
     async def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Get job status from any worker."""
@@ -219,9 +284,17 @@ class WorkerPool:
                 return status
         return None
 
-    async def initialize(self, jwt_token: str) -> None:
-        """Initialize all workers metadata cache."""
-        await asyncio.gather(*[worker.initialize(jwt_token) for worker in self.workers])
+    def get_all_jobs_status(self) -> list[dict]:
+        jobs = []
+        for worker in self.workers:
+            jobs.extend(worker.get_all_jobs_status())
+        return jobs
+        
+    def cancel_job(self, job_id: str) -> bool:
+        for worker in self.workers:
+            if worker.cancel_job(job_id):
+                return True
+        return False
 
     async def shutdown(self) -> None:
         """Shutdown all workers."""

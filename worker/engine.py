@@ -1,23 +1,21 @@
 import asyncio
 import logging
 from typing import Optional, Any, Dict, Awaitable, Callable, List
+# pyrefly: ignore [missing-import]
 import httpx
 from enum import Enum
 import random
 import copy
+from worker.retry import RetryManager, RetryConfig
 
 logger = logging.getLogger(__name__)
-
-
-class BurstStrategy(Enum):
-    BURST_100MS = 0.1
-    BURST_150MS = 0.15
-    BURST_200MS = 0.2
 
 
 class RequestEngine:
     REGIST_URL = "https://tinchi-api.neu.edu.vn/api/Regist/RegistScheduleStudyUnit"
     ALL_COURSES_URL = "https://tinchi-api.neu.edu.vn/api/Regist/GetAllScheduleUnitAllowRegist"
+    AUTH_URL = "https://tinchi-api.neu.edu.vn/api/Authen/Authenticate"
+    STUDY_PROGRAM_URL = "https://tinchi-api.neu.edu.vn/api/Authen/GetAllStudyProgramRegist"
 
     def __init__(
         self,
@@ -39,19 +37,61 @@ class RequestEngine:
         self.course_cache: Dict[str, Dict[str, Any]] = {}
         self.cache_lock = asyncio.Lock()
 
-    def _build_shared_headers(self, jwt_token: str) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {jwt_token}",
+    def _build_shared_headers(self, jwt_token: Optional[str] = None) -> Dict[str, str]:
+        headers = {
             "Apikey": "pscRBF0zT2Mqo6vMw69YMOH43lrB2RtXBS0EHit2kzv",
             "Clientid": "dtl",
             "Origin": "https://tinchi.neu.edu.vn",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         }
+        if jwt_token:
+            headers["Authorization"] = f"Bearer {jwt_token}"
+        return headers
 
-    async def fetch_course_metadata(self, jwt_token: str, course_ids: List[str]) -> None:
+    async def authenticate(self, username: str, password: str) -> str:
+        headers = self._build_shared_headers(jwt_token=None)
+        headers["Content-Type"] = "application/json"
+        try:
+            response = await self.client.post(
+                self.AUTH_URL,
+                json={"username": username, "password": password},
+                headers=headers,
+                timeout=10.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            if "Token" not in data:
+                raise ValueError("Không tìm thấy Token trong response đăng nhập")
+            logger.info("Đăng nhập thành công, đã lấy được Token.")
+            return data["Token"]
+        except Exception as e:
+            logger.error("Lỗi đăng nhập: %s", e)
+            raise Exception(f"Đăng nhập thất bại: {e}")
+
+    async def fetch_study_program_id(self, jwt_token: str) -> str:
+        headers = self._build_shared_headers(jwt_token)
+        try:
+            response = await self.client.get(
+                self.STUDY_PROGRAM_URL,
+                headers=headers,
+                timeout=10.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not data or not isinstance(data, list):
+                raise ValueError("Response Study Program không hợp lệ")
+            study_program_id = data[0].get("StudyProgramID")
+            if not study_program_id:
+                raise ValueError("Không tìm thấy StudyProgramID trong object trả về")
+            logger.info("Đã lấy được StudyProgramID: %s", study_program_id)
+            return study_program_id
+        except Exception as e:
+            logger.error("Lỗi lấy StudyProgramID: %s", e)
+            raise Exception(f"Lấy StudyProgramID thất bại: {e}")
+
+    async def fetch_course_metadata(self, jwt_token: str, course_ids: List[str], study_program_id: str, regist_type: str) -> None:
         """Fetch and cache course metadata by CurriculumID for requested courses."""
         headers = self._build_shared_headers(jwt_token)
-        study_program_id = "K667480201"
-        regist_type = "NKH"
         for course_id in course_ids:
             print(f"👉 Đang xử lý ID gốc truyền vào: '{course_id}'")
             base_id = course_id.split("_", 1)[0]
@@ -93,10 +133,38 @@ class RequestEngine:
             except Exception as e:
                 logger.error("Lỗi tải metadata cho môn %s: %s", course_id, e)
 
+    async def is_slot_available(self, jwt_token: str, course_id: str, study_program_id: str, regist_type: str) -> bool:
+        headers = self._build_shared_headers(jwt_token)
+        base_id = course_id.split("_", 1)[0]
+        payload = {
+            "ReqParam1": study_program_id,
+            "ReqParam2": regist_type,
+            "ReqParam3": base_id,
+        }
+        try:
+            response = await self.client.post(
+                self.ALL_COURSES_URL,
+                json=payload,
+                headers=headers,
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, list):
+                return False
+            match = next((item for item in data if isinstance(item, dict) and item.get("CurriculumID") == course_id), None)
+            if match is None:
+                return False
+            return int(match.get("NumberOfStudents", 0)) < int(match.get("MaxStudentNumber", 1))
+        except Exception as e:
+            logger.error("Lỗi khi check slot môn %s: %s", course_id, e)
+            raise
+
     async def register_course(
         self,
         curriculum_ids: list[str],
         study_program_id: str,
+        regist_type: str,
         jwt_token: str,
         refresh_jwt_token: Optional[Callable[[], Awaitable[str]]] = None,
     ) -> Dict[str, Any]:
@@ -107,8 +175,8 @@ class RequestEngine:
         params = {
             "TurnID": "139",
             "Action": "REGIST",
-            "StudyProgramID": "K667480201",
-            "RegistType": "NKH",
+            "StudyProgramID": study_program_id,
+            "RegistType": regist_type,
         }
         headers = self._build_shared_headers(jwt_token)
 
@@ -120,8 +188,11 @@ class RequestEngine:
             "status_code": None,
             "message": "Không có course_id hợp lệ để gửi",
         }
+        max_attempts = max(1, self.max_attempts_per_job or 5)
 
         for course_id in curriculum_ids:
+            if self.success_flag.is_set():
+                break
             cached_obj = cache_snapshot.get(course_id)
             if not isinstance(cached_obj, dict):
                 logger.error("Lỗi: Không tìm thấy lớp %s trong course_cache", course_id)
@@ -137,7 +208,10 @@ class RequestEngine:
             payload_obj["isOpen"] = True
             payload_obj["isOpenChilrentTask"] = False
 
-            try:
+            async def _fire_request() -> Dict[str, Any]:
+                if self.success_flag.is_set():
+                    raise RuntimeError("Skipped because success_flag already set")
+
                 response = await self.client.post(
                     "https://tinchi-api.neu.edu.vn/api/Regist/RegistScheduleStudyUnit",
                     params=params,
@@ -149,7 +223,6 @@ class RequestEngine:
 
                 response_text = response.text
                 logger.info("NEU response status=%s body=%s", response.status_code, response_text)
-
                 try:
                     response_payload = response.json()
                     parsed_message = (
@@ -160,16 +233,57 @@ class RequestEngine:
                 except ValueError:
                     parsed_message = response_text
 
-                last_detail = {
+                detail = {
                     "success": response.status_code == 200,
                     "status_code": response.status_code,
                     "message": parsed_message or response_text or "No response body",
                 }
 
                 if response.status_code == 200:
+                    return detail
+
+                if response.status_code in (400, 401, 403, 409):
+                    raise httpx.HTTPStatusError(
+                        f"Fatal response {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+
+                if response.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        f"Server overload {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+
+                return detail
+
+            config = RetryConfig(max_retries=10, base_delay_ms=100, max_delay_ms=500)
+            try:
+                result = await RetryManager.execute_with_retry(
+                    coro_fn=_fire_request,
+                    config=config,
+                    on_retry=lambda idx, err: logger.warning(
+                        "Server quá tải, đang thử lại lần %s... (%s)",
+                        idx,
+                        err,
+                    ),
+                )
+                last_detail = result
+                if result.get("success"):
                     self.result = True
                     self.success_flag.set()
-                    return last_detail
+                    logger.info("Đăng ký thành công")
+                    return result
+            except httpx.HTTPStatusError as e:
+                status_code = e.response.status_code if e.response is not None else None
+                response_text = e.response.text if e.response is not None else str(e)
+                logger.error("Lỗi fatal %s cho %s, dừng retry.", status_code, course_id)
+                last_detail = {
+                    "success": False,
+                    "status_code": status_code,
+                    "message": response_text,
+                }
             except Exception as e:
                 logger.exception("Request attempt failed for %s: %s", course_id, e)
                 last_detail = {
@@ -180,121 +294,36 @@ class RequestEngine:
 
         return last_detail
 
-    async def _attempt_register(
-        self,
-        curriculum_ids: list[str],
-        study_program_id: str,
-        jwt_token: str,
-    ) -> Dict[str, Any]:
-        """Single registration attempt with semaphore control."""
-        if self.success_flag.is_set():
-            return None
-
-        async with self.semaphore:
-            if self.success_flag.is_set():
-                return None
-
-            try:
-                params = {
-                    "TurnID": "139",
-                    "Action": "REGIST",
-                    "StudyProgramID": study_program_id,
-                    "RegistType": "NKH",
-                }
-                async with self.cache_lock:
-                    cache_snapshot = self.course_cache.copy()
-
-                body = []
-                missing_ids = []
-                for curriculum_id in curriculum_ids:
-                    metadata = cache_snapshot.get(curriculum_id)
-                    if metadata is None:
-                        missing_ids.append(curriculum_id)
-                        continue
-                    enriched = copy.deepcopy(metadata)
-                    enriched["IsRegisted"] = False
-                    enriched["isOpen"] = True
-                    enriched["isOpenChilrentTask"] = False
-                    body.append(enriched)
-
-                if missing_ids:
-                    logger.error("Missing metadata in cache for CurriculumID: %s", missing_ids)
-
-                if not body:
-                    return {
-                        "kind": "failure",
-                        "status_code": None,
-                        "message": "No valid courses found in metadata cache",
-                    }
-
-                logger.info("Prepared full payload for %s courses", len(body))
-                headers = self._build_shared_headers(jwt_token)
-                response = await self.client.post(
-                    self.REGIST_URL,
-                    params=params,
-                    json=body,
-                    headers=headers,
-                    timeout=3.0,
-                )
-                response_text = response.text
-                logger.info("NEU response status=%s body=%s", response.status_code, response_text)
-
-                try:
-                    response_payload = response.json()
-                    parsed_message = response_payload.get("message") if isinstance(response_payload, dict) else str(response_payload)
-                except ValueError:
-                    parsed_message = response_text
-
-                detail = {
-                    "status_code": response.status_code,
-                    "message": parsed_message or response_text or "No response body",
-                }
-
-                if response.status_code == 200:
-                    self.result = True
-                    self.success_flag.set()
-                    return {"kind": "success", **detail}
-
-                if response.status_code == 401:
-                    return {"kind": "unauthorized", **detail}
-
-                if response.status_code in (403, 429):
-                    return {"kind": "rate_limited", **detail}
-
-                if response.status_code in (400, 409):
-                    return {"kind": "failure", **detail}
-
-                if response.status_code >= 500:
-                    return {"kind": "retryable", **detail}
-
-                return {"kind": "failure", **detail}
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.exception("Request attempt failed: %s", e)
-                return {"kind": "retryable", "status_code": None, "message": str(e)}
-
     async def multi_course_register(
         self,
         course_ids: list[str],
         study_program_id: str,
+        regist_type: str,
         jwt_token: str,
-    ) -> Dict[str, bool]:
+    ) -> Dict[str, Dict[str, Any]]:
         """Register multiple courses concurrently."""
         tasks = [
             self.register_course(
                 curriculum_ids=[course_id],
                 study_program_id=study_program_id,
+                regist_type=regist_type,
                 jwt_token=jwt_token,
             )
             for course_id in course_ids
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        return {
-            course_id: bool(result) if not isinstance(result, Exception) else False
-            for course_id, result in zip(course_ids, results)
-        }
+        
+        final_results = {}
+        for course_id, result in zip(course_ids, results):
+            if isinstance(result, Exception):
+                final_results[course_id] = {
+                    "success": False,
+                    "status_code": None,
+                    "message": str(result)
+                }
+            else:
+                final_results[course_id] = result
+        return final_results
 
 
 class FastScheduler:
@@ -305,49 +334,3 @@ class FastScheduler:
         await PrecisionScheduler.wait_until(target_timestamp, offset_ms)
 
 
-class RetryStrategy:
-    class ErrorType(Enum):
-        LOGIN_FAILED = "login_failed"
-        SLOT_FULL = "slot_full"
-        RATE_LIMIT = "rate_limit"
-        SERVER_ERROR = "server_error"
-        NETWORK_ERROR = "network_error"
-        SUCCESS = "success"
-
-    @staticmethod
-    def classify_error(status_code: Optional[int], exception: Optional[Exception]) -> str:
-        if exception is None and status_code == 200:
-            return RetryStrategy.ErrorType.SUCCESS.value
-
-        if isinstance(exception, asyncio.TimeoutError):
-            return RetryStrategy.ErrorType.NETWORK_ERROR.value
-
-        if status_code == 401:
-            return RetryStrategy.ErrorType.LOGIN_FAILED.value
-
-        if status_code == 409:
-            return RetryStrategy.ErrorType.SLOT_FULL.value
-
-        if status_code == 429:
-            return RetryStrategy.ErrorType.RATE_LIMIT.value
-
-        if status_code and status_code >= 500:
-            return RetryStrategy.ErrorType.SERVER_ERROR.value
-
-        return RetryStrategy.ErrorType.NETWORK_ERROR.value
-
-    @staticmethod
-    async def retry_with_backoff(
-        coro_fn,
-        max_retries: int = 3,
-        base_delay_ms: int = 10,
-    ) -> Any:
-        """Exponential backoff retry."""
-        for attempt in range(max_retries):
-            try:
-                return await coro_fn()
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise
-                delay = (base_delay_ms * (2 ** attempt)) / 1000.0
-                await asyncio.sleep(delay)
