@@ -25,6 +25,23 @@ Services:
 - `worker`: Celery worker
 - `postgres`: PostgreSQL 16 with persistent `postgres_data`
 - `redis`: Redis 7 with persistent `redis_data`
+- `frontend`: React dev server on `http://localhost:5173`
+
+## Home Production
+
+For a Windows home machine with Docker Desktop and Cloudflare Tunnel, use:
+
+```powershell
+Copy-Item .env.home.example .env.home
+docker compose -f docker-compose.home.yml --env-file .env.home up -d --build
+```
+
+Edit `.env.home` before starting and set:
+
+- `POSTGRES_PASSWORD`
+- `CLOUDFLARE_TUNNEL_TOKEN`
+
+See [deploy/home/README.md](deploy/home/README.md) for tunnel and backup instructions.
 
 ## API Flow
 

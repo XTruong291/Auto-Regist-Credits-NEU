@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.home.example
+backups/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+node_modules/

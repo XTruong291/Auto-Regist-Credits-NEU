@@ -1,0 +1,91 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: neu-postgres-home
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-neu_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-neu_bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ${BACKUP_DIR:-./backups}:/backups
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: neu-redis-home
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: neu-api-home
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-neu_bot}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-neu_bot}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      SCAN_INTERVAL_MIN_SECONDS: ${SCAN_INTERVAL_MIN_SECONDS:-1.0}
+      SCAN_INTERVAL_MAX_SECONDS: ${SCAN_INTERVAL_MAX_SECONDS:-2.5}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-604800}
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build: .
+    container_name: neu-worker-home
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-neu_bot}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-neu_bot}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      SCAN_INTERVAL_MIN_SECONDS: ${SCAN_INTERVAL_MIN_SECONDS:-1.0}
+      SCAN_INTERVAL_MAX_SECONDS: ${SCAN_INTERVAL_MAX_SECONDS:-2.5}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-604800}
+    command: ["celery", "-A", "worker.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=${CELERY_WORKER_CONCURRENCY:-2}"]
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../Auto-Regist-Credits-NEU-UI
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_BASE_URL: /api
+    container_name: neu-frontend-home
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  proxy:
+    image: caddy:2-alpine
+    container_name: neu-proxy-home
+    volumes:
+      - ./deploy/home/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - api
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: neu-cloudflared-home
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:?CLOUDFLARE_TUNNEL_TOKEN is required}"]
+    depends_on:
+      - proxy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:
