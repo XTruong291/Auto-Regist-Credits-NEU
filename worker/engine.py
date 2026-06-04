@@ -3,8 +3,6 @@ import logging
 from typing import Optional, Any, Dict, Awaitable, Callable, List
 # pyrefly: ignore [missing-import]
 import httpx
-from enum import Enum
-import random
 import copy
 from worker.retry import RetryManager, RetryConfig
 
@@ -15,25 +13,17 @@ class RequestEngine:
     REGIST_URL = "https://tinchi-api.neu.edu.vn/api/Regist/RegistScheduleStudyUnit"
     ALL_COURSES_URL = "https://tinchi-api.neu.edu.vn/api/Regist/GetAllScheduleUnitAllowRegist"
     AUTH_URL = "https://tinchi-api.neu.edu.vn/api/Authen/Authenticate"
+    AUTH_FALLBACK_URL = "https://tinchi-api.neu.edu.vn/api/Auth/Login"
     STUDY_PROGRAM_URL = "https://tinchi-api.neu.edu.vn/api/Authen/GetAllStudyProgramRegist"
 
     def __init__(
         self,
         client: httpx.AsyncClient,
-        max_concurrent: int = 10,
-        num_bursts: int = 4,
-        burst_delay_ms: int = 150,
         max_attempts_per_job: int = 10,
     ):
         self.client = client
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.num_bursts = num_bursts
-        self.burst_delay = burst_delay_ms / 1000.0
         self.max_attempts_per_job = max_attempts_per_job
-        self.success_flag = asyncio.Event()
-        self.result = None
         self.last_result_detail: Dict[str, Any] = {}
-        self.active_tasks: set[asyncio.Task] = set()
         self.course_cache: Dict[str, Dict[str, Any]] = {}
         self.cache_lock = asyncio.Lock()
 
@@ -51,22 +41,60 @@ class RequestEngine:
     async def authenticate(self, username: str, password: str) -> str:
         headers = self._build_shared_headers(jwt_token=None)
         headers["Content-Type"] = "application/json"
-        try:
-            response = await self.client.post(
-                self.AUTH_URL,
-                json={"username": username, "password": password},
-                headers=headers,
-                timeout=10.0
-            )
-            response.raise_for_status()
-            data = response.json()
-            if "Token" not in data:
-                raise ValueError("Không tìm thấy Token trong response đăng nhập")
-            logger.info("Đăng nhập thành công, đã lấy được Token.")
-            return data["Token"]
-        except Exception as e:
-            logger.error("Lỗi đăng nhập: %s", e)
-            raise Exception(f"Đăng nhập thất bại: {e}")
+        payload = {"username": username, "password": password}
+        last_error: Exception | None = None
+
+        for auth_url in (self.AUTH_URL, self.AUTH_FALLBACK_URL):
+            try:
+                response = await self.client.post(
+                    auth_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                data = response.json()
+                token = self._extract_token(data)
+                logger.info("Đăng nhập thành công, đã lấy được Token.")
+                return token
+            except Exception as e:
+                last_error = e
+                logger.warning("Lỗi đăng nhập qua %s: %s", auth_url, e)
+
+        raise Exception(f"Đăng nhập thất bại: {last_error}")
+
+    def _extract_token(self, data: Any) -> str:
+        if not isinstance(data, dict):
+            raise ValueError("Response đăng nhập không phải JSON object")
+
+        candidates = [
+            data.get("Token"),
+            data.get("token"),
+            data.get("AccessToken"),
+            data.get("access_token"),
+            data.get("JWT"),
+            data.get("jwt"),
+        ]
+        for container_key in ("data", "result", "Data", "Result"):
+            container = data.get(container_key)
+            if isinstance(container, dict):
+                candidates.extend(
+                    [
+                        container.get("Token"),
+                        container.get("token"),
+                        container.get("AccessToken"),
+                        container.get("access_token"),
+                        container.get("JWT"),
+                        container.get("jwt"),
+                    ]
+                )
+
+        for token in candidates:
+            if isinstance(token, str) and token.strip():
+                return token.strip()
+
+        safe_keys = ", ".join(sorted(str(key) for key in data.keys()))
+        raise ValueError(f"Không tìm thấy token trong response đăng nhập. Keys: {safe_keys}")
 
     async def fetch_study_program_id(self, jwt_token: str) -> str:
         headers = self._build_shared_headers(jwt_token)
@@ -185,8 +213,6 @@ class RequestEngine:
         jwt_token: str,
         refresh_jwt_token: Optional[Callable[[], Awaitable[str]]] = None,
     ) -> Dict[str, Any]:
-        self.success_flag.clear()
-        self.result = None
         self.last_result_detail = {}
 
         params = {
@@ -208,8 +234,6 @@ class RequestEngine:
         max_attempts = max(1, self.max_attempts_per_job or 5)
 
         for course_id in curriculum_ids:
-            if self.success_flag.is_set():
-                break
             cached_obj = cache_snapshot.get(course_id)
             if not isinstance(cached_obj, dict):
                 logger.warning("Cache rỗng cho môn %s. Bot đang tự động đi lấy metadata...", course_id)
@@ -236,9 +260,6 @@ class RequestEngine:
             payload_obj["isOpenChilrentTask"] = False
 
             async def _fire_request() -> Dict[str, Any]:
-                if self.success_flag.is_set():
-                    raise RuntimeError("Skipped because success_flag already set")
-
                 response = await self.client.post(
                     "https://tinchi-api.neu.edu.vn/api/Regist/RegistScheduleStudyUnit",
                     params=params,
@@ -298,8 +319,6 @@ class RequestEngine:
                 )
                 last_detail = result
                 if result.get("success"):
-                    self.result = True
-                    self.success_flag.set()
                     logger.info("Đăng ký thành công")
                     return result
             except httpx.HTTPStatusError as e:
@@ -351,13 +370,3 @@ class RequestEngine:
             else:
                 final_results[course_id] = result
         return final_results
-
-
-class FastScheduler:
-    @staticmethod
-    async def wait_until(target_timestamp: float, offset_ms: int = 0) -> None:
-        """High-precision wait using PrecisionScheduler."""
-        from worker.scheduler import PrecisionScheduler
-        await PrecisionScheduler.wait_until(target_timestamp, offset_ms)
-
-

@@ -91,16 +91,6 @@ class PrecisionScheduler:
         return await coro_fn()
 
     @staticmethod
-    async def schedule_burst(
-        target_timestamp: float,
-        coro_list: list[Callable[[], Any]],
-        offset_ms: int = 0,
-    ) -> list[Any]:
-        """Schedule burst of coroutines at precise target time."""
-        await PrecisionScheduler.wait_until(target_timestamp, offset_ms)
-        return await asyncio.gather(*[coro() for coro in coro_list], return_exceptions=True)
-
-    @staticmethod
     def get_current_timestamp() -> float:
         """Get current high-precision timestamp (unix time)."""
         return time.time()

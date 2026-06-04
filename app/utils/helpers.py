@@ -1,18 +1,12 @@
 import random
 import string
 import asyncio
-from typing import List
 
 
 def generate_request_id(prefix: str = "req") -> str:
     """Generate unique request ID."""
     random_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
     return f"{prefix}_{random_suffix}"
-
-
-def calculate_next_burst_time(current_time: float, burst_delay_ms: int) -> float:
-    """Calculate next burst execution time."""
-    return current_time + (burst_delay_ms / 1000.0)
 
 
 async def rate_limiter(call_count: int, period_seconds: int):
