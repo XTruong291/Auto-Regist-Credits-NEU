@@ -267,7 +267,7 @@ class RequestEngine:
                     headers=headers,
                     timeout=3.0,
                 )
-                print(f"🚀 Request thành công tới URL: {response.request.url}")
+                logger.info("Request sent to %s", response.request.url)
 
                 response_text = response.text
                 logger.info("NEU response status=%s body=%s", response.status_code, response_text)

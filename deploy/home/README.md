@@ -70,3 +70,41 @@ In Cloudflare Zero Trust:
 - Point the service to `http://proxy:80`.
 
 Cloudflared runs inside Docker, so `proxy` is resolved by the Docker network.
+
+---
+
+## Phương án miễn phí: Quick Tunnel (không cần domain)
+
+Dùng `docker-compose.quicktunnel.yml` — không cần tài khoản Cloudflare, không cần domain.
+
+**Nhược điểm:** URL ngẫu nhiên, thay đổi mỗi khi restart cloudflared.
+
+Setup:
+
+```powershell
+Copy-Item .env.quicktunnel.example .env.quicktunnel
+```
+
+Điền `POSTGRES_PASSWORD` vào `.env.quicktunnel`, sau đó chạy:
+
+```powershell
+docker compose -f docker-compose.quicktunnel.yml --env-file .env.quicktunnel up -d --build
+```
+
+Lấy URL công khai từ log:
+
+```powershell
+docker compose -f docker-compose.quicktunnel.yml --env-file .env.quicktunnel logs cloudflared
+```
+
+Tìm dòng có dạng:
+```
+Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):
+https://abc-def-ghi.trycloudflare.com
+```
+
+Dừng:
+
+```powershell
+docker compose -f docker-compose.quicktunnel.yml --env-file .env.quicktunnel down
+```

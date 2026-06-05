@@ -28,7 +28,7 @@ from app.schemas.job import (
     NeuLoginRequest,
     NeuLoginResponse,
 )
-from config import AppConfig, get_logger
+from config import AppConfig, EnvironmentEnum, get_logger
 from worker.engine import RequestEngine
 from worker.tasks import run_registration_job
 
@@ -48,11 +48,13 @@ app = FastAPI(
     title=AppConfig.API_TITLE,
     version=AppConfig.API_VERSION,
     lifespan=lifespan,
+    docs_url=None if AppConfig.ENV == EnvironmentEnum.PRODUCTION else "/docs",
+    redoc_url=None if AppConfig.ENV == EnvironmentEnum.PRODUCTION else "/redoc",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=AppConfig.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["Authorization", "Content-Type"],

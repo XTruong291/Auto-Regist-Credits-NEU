@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:16
-    container_name: neu-postgres-home
+    container_name: neu-postgres-qt
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-neu_bot}
       POSTGRES_USER: ${POSTGRES_USER:-neu_bot}
@@ -18,7 +18,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: neu-redis-home
+    container_name: neu-redis-qt
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -26,7 +26,7 @@ services:
 
   api:
     build: .
-    container_name: neu-api-home
+    container_name: neu-api-qt
     environment:
       ENV: production
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -36,7 +36,7 @@ services:
       SCAN_INTERVAL_MIN_SECONDS: ${SCAN_INTERVAL_MIN_SECONDS:-1.0}
       SCAN_INTERVAL_MAX_SECONDS: ${SCAN_INTERVAL_MAX_SECONDS:-2.5}
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-604800}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
     depends_on:
       postgres:
@@ -47,7 +47,7 @@ services:
 
   worker:
     build: .
-    container_name: neu-worker-home
+    container_name: neu-worker-qt
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-neu_bot}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-neu_bot}
@@ -70,14 +70,14 @@ services:
       dockerfile: Dockerfile.prod
       args:
         VITE_API_BASE_URL: /api
-    container_name: neu-frontend-home
+    container_name: neu-frontend-qt
     depends_on:
       - api
     restart: unless-stopped
 
   proxy:
     image: caddy:2-alpine
-    container_name: neu-proxy-home
+    container_name: neu-proxy-qt
     volumes:
       - ./deploy/home/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -89,8 +89,9 @@ services:
 
   cloudflared:
     image: cloudflare/cloudflared:latest
-    container_name: neu-cloudflared-home
-    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:?CLOUDFLARE_TUNNEL_TOKEN is required}"]
+    container_name: neu-cloudflared-qt
+    # Quick Tunnel: không cần tài khoản hay domain, URL ngẫu nhiên *.trycloudflare.com
+    command: ["tunnel", "--no-autoupdate", "--url", "http://proxy:80"]
     depends_on:
       - proxy
     restart: unless-stopped
